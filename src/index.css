@@ -1,0 +1,49 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Inter', sans-serif;
+    @apply bg-neutral-950 text-neutral-50 antialiased;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-neutral-900/60 backdrop-blur-2xl border border-neutral-800/80 shadow-2xl;
+  }
+  
+  .glass-button {
+    @apply relative overflow-hidden bg-neutral-800/50 hover:bg-neutral-800 border border-neutral-700/50 hover:border-neutral-600 transition-all duration-300 shadow-md hover:shadow-lg;
+  }
+  
+  .violet-glow {
+    @apply relative;
+  }
+  .violet-glow::before {
+    content: '';
+    @apply absolute -inset-0.5 bg-gradient-to-r from-violet-600 to-indigo-600 rounded-lg blur opacity-30 transition duration-1000 group-hover:opacity-100 group-hover:duration-200;
+  }
+}
+
+/* Custom minimal scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  border-radius: 10px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+
+/* Seamless hide default file inputs */
+input[type="file"] {
+  display: none;
+}
