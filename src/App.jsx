@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { 
+  LineChart, Line, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Cell
+} from 'recharts';
 import {
   Home,
   Users,
@@ -16,6 +19,7 @@ import {
   Repeat,
   Heart,
   ChevronDown,
+  ChevronLeft,
   ChevronUp,
   Settings2,
   Instagram,
@@ -50,8 +54,9 @@ import {
   Download,
   HelpCircle
 } from 'lucide-react';
-import { db } from './firebase';
-import { collection, addDoc, getDocs, query, where, updateDoc, doc, deleteDoc, getDoc, setDoc } from 'firebase/firestore';
+import { db, auth } from './firebase';
+import { collection, query, where, getDocs, doc, getDoc, setDoc, updateDoc, addDoc, deleteDoc, onSnapshot } from "firebase/firestore";
+import { signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "firebase/auth";
 import appLogo from './assets/logo.png';
 import apiService from './services/api';
 
@@ -68,7 +73,7 @@ if (!localStorage.getItem('threadsAccountsDB')) {
 // --- Subscription Plan Definitions ---
 const SUBSCRIPTION_PLANS = {
   trial: { name: 'Trial', maxAccounts: 1, features: ['post'], price: 0 },
-  entry: { name: 'Entry', maxAccounts: 1, features: ['post'], price: 2980 },
+  entry: { name: 'Entry', maxAccounts: 1, features: ['post', 'engine'], price: 2980 },
   advance: { name: 'Advance', maxAccounts: 5, features: ['post', 'like', 'engine'], price: 9980 },
   pro: { name: 'Pro', maxAccounts: 20, features: ['post', 'like', 'engine', 'proxy'], price: 29800 },
   enterprise: { name: 'Enterprise', maxAccounts: 100, features: ['post', 'like', 'engine', 'proxy'], price: 'Price Negotiable' },
@@ -287,7 +292,8 @@ const AutomationEngine = ({ accounts, onAccountsUpdate }) => {
             const credentials = {
               username: execAccount.threadsUsername,
               password: execAccount.threadsPassword,
-              proxy: execAccount.proxy
+              proxy: execAccount.proxy,
+              threadsApiKey: execAccount.personaSettings?.threadsApiKey
             };
 
             try {
@@ -334,8 +340,7 @@ const AutomationEngine = ({ accounts, onAccountsUpdate }) => {
 
   const runCycle = async (accountId) => {
     // Re-fetch account from latest props/state if possible, or just use the id to find it
-    const accountsDB = JSON.parse(localStorage.getItem('threadsAccountsDB') || '[]');
-    const account = accountsDB.find(a => a.id === accountId);
+    const account = rawAccounts.find(a => a.id === accountId);
     
     if (!account || account.status !== 'active') return;
 
@@ -344,10 +349,12 @@ const AutomationEngine = ({ accounts, onAccountsUpdate }) => {
     const aiModel = persona.aiModel || 'gemini-1.5-flash';
     
     const keyMap = {
-      gemini: localStorage.getItem('geminiApiKey'),
-      openai: localStorage.getItem('openaiApiKey'),
-      anthropic: localStorage.getItem('anthropicApiKey')
+      gemini: persona.geminiApiKey || localStorage.getItem('geminiApiKey'),
+      openai: persona.openaiApiKey || localStorage.getItem('openaiApiKey'),
+      anthropic: persona.anthropicApiKey || localStorage.getItem('anthropicApiKey'),
+      manus: persona.manusApiKey || localStorage.getItem('manusApiKey')
     };
+
 
     try {
       if (apiService.isElectron) apiService.logToServer(`[AutoPilot:${account.threadsUsername}] Cycle started.`);
@@ -380,8 +387,10 @@ const AutomationEngine = ({ accounts, onAccountsUpdate }) => {
         const credentials = {
           username: account.threadsUsername,
           password: account.threadsPassword,
-          proxy: account.proxy
+          proxy: account.proxy,
+          threadsApiKey: account.personaSettings?.threadsApiKey
         };
+
 
         // 4. Post to Threads
         await apiService.postToThreads(account.id, credentials, content, imagePath);
@@ -439,13 +448,12 @@ const AutomationEngine = ({ accounts, onAccountsUpdate }) => {
         }
       }
 
-      // Update Last Run
-      const updatedDB = accountsDB.map(acc => {
+      // Note: AutoPilot component doesn't directly mutate localStorage anymore
+      const newDB = (Array.isArray(rawAccounts) ? rawAccounts : []).map(acc => {
         if (acc.id === accountId) return { ...acc, lastRun: Date.now() };
         return acc;
       });
-      localStorage.setItem('threadsAccountsDB', JSON.stringify(updatedDB));
-      if (onAccountsUpdate) onAccountsUpdate(updatedDB);
+      if (onAccountsUpdate) onAccountsUpdate(newDB);
 
       if (apiService.isElectron) apiService.logToServer(`[AutoPilot:${account.threadsUsername}] Cycle finished.`);
     } catch (error) {
@@ -836,10 +844,12 @@ const handleGenerateNoteArticle = async () => {
 `;
 
     const keyMap = {
-      gemini: localStorage.getItem('geminiApiKey'),
-      openai: localStorage.getItem('openaiApiKey'),
-      anthropic: localStorage.getItem('anthropicApiKey')
+      gemini: persona.geminiApiKey || localStorage.getItem('geminiApiKey'),
+      openai: persona.openaiApiKey || localStorage.getItem('openaiApiKey'),
+      anthropic: persona.anthropicApiKey || localStorage.getItem('anthropicApiKey'),
+      manus: persona.manusApiKey || localStorage.getItem('manusApiKey')
     };
+
     const provider = persona.aiProvider || 'gemini';
     const model = persona.aiModel || 'gemini-1.5-flash';
 
@@ -1243,7 +1253,11 @@ const handleGenerateNoteArticle = async () => {
                     console.log("Starting test post dispatcher...");
                     const res = await apiService.postToThreads(
                       account.id,
-                      { username: account.threadsUsername || account.username, password: account.threadsPassword },
+                      { 
+                        username: account.threadsUsername || account.username, 
+                        password: account.threadsPassword,
+                        threadsApiKey: account.personaSettings?.threadsApiKey
+                      },
                       "テスト投稿です (Automated via AutoThreader)"
                     );
                     if (res.success) {
@@ -1384,177 +1398,343 @@ const handleGenerateNoteArticle = async () => {
   );
 };
 
-// ビュー: ダッシュボード
 const DashboardView = ({ accounts, onNavigate }) => {
+  const [liveInsights, setLiveInsights] = useState({});
+  const [liveMedia, setLiveMedia] = useState({});
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [selectedAccountId, setSelectedAccountId] = useState(accounts[0]?.id || null);
+  const [timeRange, setTimeRange] = useState('7d');
 
-  const totalFollowers = accounts.reduce((acc, curr) => acc + (curr.followers || 0), 0);
-  const activeCount = accounts.filter(a => a.status === 'active').length;
-  const errorCount = accounts.filter(a => a.status === 'error').length;
-  const avgEngRate = accounts.length > 0 ? (accounts.reduce((acc, curr) => acc + (curr.engagement || 0), 0) / accounts.length).toFixed(1) : "0.0";
+  const fetchLiveInsights = async () => {
+    const accountsWithKeys = accounts.filter(a => a.personaSettings?.threadsApiKey);
+    
+    if (accountsWithKeys.length === 0) {
+      console.log("[Dashboard] No accounts with Threads API keys found.");
+      // If manually triggered, we might want an alert, but for useEffect we stay silent
+      return;
+    }
+
+    setIsSyncing(true);
+    const newInsights = { ...liveInsights };
+    const newMedia = { ...liveMedia };
+
+    try {
+      console.log(`[DashboardSync] Starting parallel sync for ${accountsWithKeys.length} accounts...`);
+      
+      const results = await Promise.all(accountsWithKeys.map(async (acc) => {
+        try {
+          console.log(`[DashboardSync] Syncing @${acc.threadsUsername || acc.username}...`);
+          const token = acc.personaSettings.threadsApiKey;
+          
+          // 1. User Insights
+          const res = await apiService.getThreadsUserInsights(token);
+          if (!res.success) throw new Error(res.error || "User insights failed");
+          
+          const metrics = {};
+          if (Array.isArray(res.data)) {
+            res.data.forEach(m => {
+              if (m.name && m.values?.[0]) metrics[m.name] = m.values[0].value;
+              else if (m.name) metrics[m.name] = 0;
+            });
+          }
+          
+          // 2. Media & Media Insights
+          let accountMedia = [];
+          const mediaRes = await apiService.getThreadsMedia(token);
+          if (mediaRes.success && Array.isArray(mediaRes.data)) {
+            accountMedia = mediaRes.data;
+            const latestMedia = accountMedia[0];
+            if (latestMedia) {
+              const miRes = await apiService.getThreadsMediaInsights(token, latestMedia.id);
+              if (miRes.success && Array.isArray(miRes.data)) {
+                latestMedia.insights = {};
+                miRes.data.forEach(m => {
+                  if (m.name && m.values?.[0]) latestMedia.insights[m.name] = m.values[0].value;
+                });
+              }
+            }
+          }
+          
+          console.log(`[DashboardSync] Done for @${acc.threadsUsername || acc.username}`);
+          return { id: acc.id, metrics, media: accountMedia, success: true };
+        } catch (err) {
+          console.error(`[DashboardSync] Failed for @${acc.threadsUsername || acc.username}:`, err.message);
+          return { id: acc.id, error: err.message, success: false, name: `@${acc.threadsUsername || acc.username}` };
+        }
+      }));
+
+      // Update state once with all results
+      const failedAccounts = [];
+      results.forEach(res => {
+        if (res.success) {
+          newInsights[res.id] = res.metrics;
+          newMedia[res.id] = res.media;
+        } else {
+          failedAccounts.push(res);
+        }
+      });
+
+      setLiveInsights(newInsights);
+      setLiveMedia(newMedia);
+      console.log(`[DashboardSync] All syncs completed. Failures: ${failedAccounts.length}`);
+
+      if (failedAccounts.length > 0) {
+        const isPermissionError = failedAccounts.some(f => f.error?.includes('permission') || f.error?.includes('OAuth'));
+        if (isPermissionError) {
+          alert("一部のアカウントで同期に失敗しました。\n\n原因: 権限不足 (threads_manage_insights)\n\n対処法: トークン生成時に「threads_manage_insights」にチェックを入れる必要があります。");
+        } else {
+          alert(`一部のアカウントの同期に失敗しました:\n${failedAccounts.map(f => `${f.name}: ${f.error}`).join('\n')}`);
+        }
+      }
+    } catch (e) {
+      console.error("[DashboardSync] Global sync error:", e);
+      alert("同期中に予期せぬエラーが発生しました。");
+    } finally {
+      setIsSyncing(false);
+      console.log("[DashboardSync] Spinner stopped.");
+    }
+  };
+
+  useEffect(() => {
+    fetchLiveInsights();
+    const interval = setInterval(fetchLiveInsights, 300000); // 5 mins
+    return () => clearInterval(interval);
+  }, [accounts]);
+
+  // Mock/Fallback data for UI display if no live data yet
+  const getMockChartData = () => [
+    { date: '4/18', views: 8000, likes: 300, replies: 120, reposts: 10, quotes: 2 },
+    { date: '4/19', views: 15000, likes: 450, replies: 180, reposts: 15, quotes: 4 },
+    { date: '4/20', views: 22000, likes: 700, replies: 280, reposts: 25, quotes: 8 },
+    { date: '4/21', views: 21500, likes: 650, replies: 240, reposts: 22, quotes: 6 },
+    { date: '4/22', views: 18000, likes: 500, replies: 200, reposts: 18, quotes: 5 },
+    { date: '4/23', views: 19000, likes: 580, replies: 220, reposts: 20, quotes: 7 },
+    { date: '4/24', views: 17500, likes: 540, replies: 210, reposts: 19, quotes: 6 },
+  ];
+
+  const selectedAccount = accounts.find(a => a.id === selectedAccountId) || accounts[0];
+  const insights = liveInsights[selectedAccount?.id] || { 
+    followers_count: selectedAccount?.followers || 1666, 
+    likes: 2595, 
+    replies: 956, 
+    reposts: 25, 
+    quotes: 12,
+    views: 84200
+  };
+
+  const chartData = getMockChartData();
+  const engagementData = [
+    { name: 'Likes', value: insights.likes, color: '#ec4899' },
+    { name: 'Replies', value: insights.replies, color: '#3b82f6' },
+    { name: 'Reposts', value: insights.reposts, color: '#10b981' },
+    { name: 'Quotes', value: insights.quotes, color: '#eab308' },
+  ];
 
   return (
-    <div className="flex flex-col h-full overflow-hidden bg-transparent">
-      <div className="px-8 py-8 flex flex-col gap-2 relative z-10 border-b border-neutral-800/50 bg-neutral-950/50 backdrop-blur-xl">
-        <h2 className="text-3xl font-bold text-white tracking-tight flex items-center gap-3">
-          ダッシュボード
-        </h2>
-        <p className="text-sm text-neutral-400 font-medium">システム全体の稼働状況と最新のAIパフォーマンス</p>
+    <div className="flex flex-col h-full overflow-hidden bg-neutral-950 font-sans">
+      {/* Header Area */}
+      <div className="px-8 py-6 flex items-center justify-between border-b border-neutral-800/40 bg-neutral-900/20 backdrop-blur-xl">
+        <div className="flex items-center gap-4">
+          <div className="w-10 h-10 rounded-2xl bg-violet-600/20 flex items-center justify-center border border-violet-500/30">
+            <Layout className="w-6 h-6 text-violet-400" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-white tracking-widest uppercase">Threads インサイト</h2>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+              <p className="text-[11px] font-bold text-neutral-500 uppercase tracking-widest">System Operational</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <div className="flex bg-neutral-900/80 p-1 rounded-xl border border-neutral-800">
+            <button 
+              onClick={() => setTimeRange('7d')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${timeRange === '7d' ? 'bg-violet-600 text-white' : 'text-neutral-500 hover:text-white'}`}
+            >7日</button>
+            <button 
+              onClick={() => setTimeRange('30d')}
+              className={`px-4 py-1.5 rounded-lg text-xs font-bold transition-all ${timeRange === '30d' ? 'bg-violet-600 text-white' : 'text-neutral-500 hover:text-white'}`}
+            >30日</button>
+          </div>
+          <button 
+            onClick={fetchLiveInsights}
+            disabled={isSyncing}
+            className="p-2 bg-neutral-900 border border-neutral-800 rounded-xl text-neutral-400 hover:text-white transition-all disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-8 space-y-8">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          <div className="glass-panel p-6 rounded-3xl flex flex-col justify-between group">
-            <div className="flex justify-between items-start">
-              <div>
-                <p className="text-[13px] font-semibold text-neutral-400 tracking-wide uppercase">Total Audience</p>
-                <h3 className="text-4xl font-bold text-white mt-2 tracking-tight">{totalFollowers.toLocaleString()}</h3>
-              </div>
-              <div className="p-3 bg-indigo-500/10 text-indigo-400 rounded-2xl border border-indigo-500/20 group-hover:bg-indigo-500/20 transition-colors"><Users className="w-6 h-6" /></div>
-            </div>
-            <div className="mt-6 flex items-center text-sm">
-              <span className="text-emerald-400 font-bold flex items-center bg-emerald-400/10 px-2 py-1 rounded-lg"><TrendingUp className="w-4 h-4 mr-1" />+12.5%</span>
-              <span className="text-neutral-500 ml-3 font-medium">先月比</span>
-            </div>
+      <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-hide">
+        {/* Account Subheader */}
+        <div className="flex items-end justify-between px-2">
+          <div>
+            <p className="text-[12px] font-bold text-neutral-500 uppercase tracking-widest mb-1 opacity-60">Insight Context</p>
+            <h3 className="text-sm font-bold text-neutral-300 flex items-center gap-2">
+              @{selectedAccount?.threadsUsername || selectedAccount?.username || 'account_name'} のインサイト 
+              <span className="text-neutral-500 font-medium">({timeRange === '7d' ? '過去7日' : '過去30日'})</span>
+            </h3>
+          </div>
+          <div className="flex gap-2">
+            {accounts.slice(0, 3).map(acc => (
+              <button 
+                key={acc.id}
+                onClick={() => setSelectedAccountId(acc.id)}
+                className={`px-3 py-1.5 rounded-lg text-[10px] font-bold border transition-all ${selectedAccountId === acc.id ? 'bg-violet-500/20 border-violet-500/50 text-violet-400' : 'bg-neutral-900/40 border-neutral-800 text-neutral-500'}`}
+              >
+                @{acc.threadsUsername || acc.username}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Metrics Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-6">
+          {/* Main 3 Metrics (Left) */}
+          <div className="flex flex-col gap-6">
+            <MetricCard 
+              label="FOLLOWERS" 
+              value={insights.followers_count} 
+              icon={<Users className="w-4 h-4" />} 
+              color="violet" 
+              trend="+12.5%"
+            />
+            <MetricCard 
+              label="REPLIES" 
+              value={insights.replies} 
+              icon={<MessageCircle className="w-4 h-4" />} 
+              color="blue" 
+              trend="+5.2%"
+            />
+            <MetricCard 
+              label="QUOTES" 
+              value={insights.quotes} 
+              icon={<Copy className="w-4 h-4" />} 
+              color="yellow" 
+              trend="+1.1%"
+            />
           </div>
 
-          <div className="glass-panel p-6 rounded-3xl flex flex-col justify-between group">
-            <div className="flex justify-between items-start">
-              <div>
-                <p className="text-[13px] font-semibold text-neutral-400 tracking-wide uppercase">AI Actions Today</p>
-                <h3 className="text-4xl font-bold text-white mt-2 tracking-tight">1,284</h3>
-              </div>
-              <div className="p-3 bg-violet-500/10 text-violet-400 rounded-2xl border border-violet-500/20 group-hover:bg-violet-500/20 transition-colors"><Bot className="w-6 h-6" /></div>
-            </div>
-            <div className="mt-6 flex items-center text-sm">
-              <span className="text-emerald-400 font-bold flex items-center bg-emerald-400/10 px-2 py-1 rounded-lg"><TrendingUp className="w-4 h-4 mr-1" />+5.2%</span>
-              <span className="text-neutral-500 ml-3 font-medium">前日比</span>
-            </div>
-          </div>
-
-          <div className="glass-panel p-6 rounded-3xl flex flex-col justify-between group">
-            <div className="flex justify-between items-start">
-              <div>
-                <p className="text-[13px] font-semibold text-neutral-400 tracking-wide uppercase">Avg Engagement</p>
-                <h3 className="text-4xl font-bold text-white mt-2 tracking-tight">{avgEngRate}%</h3>
-              </div>
-              <div className="p-3 bg-pink-500/10 text-pink-400 rounded-2xl border border-pink-500/20 group-hover:bg-pink-500/20 transition-colors"><Heart className="w-6 h-6" /></div>
-            </div>
-            <div className="mt-6 flex items-center text-sm">
-              <span className="text-emerald-400 font-bold flex items-center bg-emerald-400/10 px-2 py-1 rounded-lg"><TrendingUp className="w-4 h-4 mr-1" />+1.1%</span>
-              <span className="text-neutral-500 ml-3 font-medium">先月比</span>
-            </div>
-          </div>
-
-          <div className="glass-panel p-6 rounded-3xl flex flex-col justify-between group">
-            <div className="flex justify-between items-start">
-              <div>
-                <p className="text-[13px] font-semibold text-neutral-400 tracking-wide uppercase">Active Nodes</p>
-                <div className="flex items-baseline gap-2 mt-2">
-                  <h3 className="text-4xl font-bold text-white tracking-tight">{activeCount}</h3>
-                  <span className="text-neutral-500 font-medium text-lg">/ {accounts.length}</span>
+          {/* Side 2 Metrics (Right) */}
+          <div className="flex flex-col gap-6">
+            <MetricCard 
+              label="LIKES" 
+              value={insights.likes} 
+              icon={<Heart className="w-4 h-4" />} 
+              color="pink" 
+              trend="+8.7%"
+            />
+            <MetricCard 
+              label="REPOSTS" 
+              value={insights.reposts} 
+              icon={<Repeat className="w-4 h-4" />} 
+              color="emerald" 
+              trend="+2.4%"
+            />
+            
+            {/* View Stats Summary */}
+            <div className="flex-1 glass-panel p-6 rounded-3xl flex flex-col justify-center border-neutral-800/40 bg-neutral-900/30">
+              <p className="text-[11px] font-bold text-neutral-500 tracking-widest uppercase mb-1">Total Profile Views</p>
+              <h4 className="text-3xl font-bold text-white tracking-tight">{(insights.views || 0).toLocaleString()}</h4>
+              <div className="mt-4 flex items-center justify-between">
+                <div className="flex -space-x-2">
+                  {[1,2,3].map(i => <div key={i} className="w-6 h-6 rounded-full border border-neutral-900 bg-neutral-800 flex items-center justify-center text-[8px] font-bold text-neutral-500">{i}</div>)}
                 </div>
-              </div>
-              <div className="p-3 bg-emerald-500/10 text-emerald-400 rounded-2xl border border-emerald-500/20 group-hover:bg-emerald-500/20 transition-colors"><Activity className="w-6 h-6" /></div>
-            </div>
-            <div className="mt-6 flex flex-col gap-3 text-sm">
-              <div className="flex justify-between items-center px-1">
-                <span className="text-neutral-400 text-xs font-medium">稼働状況</span>
-                <span className="text-rose-400 font-bold text-xs">{errorCount} Error</span>
-              </div>
-              <div className="w-full bg-neutral-900 rounded-full h-2 shadow-inner overflow-hidden flex border border-neutral-800">
-                <div className="bg-emerald-500 h-full shadow-[0_0_10px_rgba(16,185,129,0.5)]" style={{ width: accounts.length ? `${(activeCount / accounts.length) * 100}%` : '0%' }}></div>
-                <div className="bg-rose-500 h-full" style={{ width: accounts.length ? `${(errorCount / accounts.length) * 100}%` : '0%' }}></div>
-                <div className="bg-transparent h-full flex-1"></div>
+                <span className="text-[10px] text-emerald-400 font-bold items-center flex gap-1 bg-emerald-500/10 px-2 py-1 rounded-lg">
+                  <TrendingUp className="w-3 h-3" /> ACTIVE CONTENT
+                </span>
               </div>
             </div>
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-2 glass-panel rounded-3xl flex flex-col overflow-hidden">
-            <div className="p-6 border-b border-neutral-800/80 flex justify-between items-center bg-neutral-900/50">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Zap className="w-5 h-5 text-amber-400" />
-                トップパフォーマンス
-              </h3>
-              <button 
-                onClick={() => onNavigate('accounts')}
-                className="text-[13px] font-semibold text-neutral-400 hover:text-white flex items-center transition-colors"
-              >
-                View All <ArrowUpRight className="w-4 h-4 ml-1" />
-              </button>
+        {/* Charts Grid */}
+        <div className="grid grid-cols-1 gap-6">
+          <div className="glass-panel p-8 rounded-[2rem] border-neutral-800/40 bg-neutral-900/30 min-h-[400px] flex flex-col">
+            <div className="flex items-center justify-between mb-8 px-2">
+              <h4 className="text-[12px] font-bold text-neutral-400 tracking-widest uppercase flex items-center gap-3">
+                <span className="w-1.5 h-1.5 rounded-full bg-violet-500"></span>
+                PROFILE VIEWS (過去7日)
+              </h4>
             </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="bg-neutral-950/80 text-[12px] text-neutral-400 tracking-wider uppercase">
-                    <th className="px-6 py-4 font-semibold">Account</th>
-                    <th className="px-6 py-4 font-semibold">Followers</th>
-                    <th className="px-6 py-4 font-semibold">Eng Rate</th>
-                    <th className="px-6 py-4 font-semibold">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-neutral-800/80">
-                  {accounts.slice(0, 5).sort((a, b) => (b.followers || 0) - (a.followers || 0)).map((account) => (
-                    <tr key={account.id} className="hover:bg-neutral-800/30 transition-colors group">
-                      <td className="px-6 py-4 flex items-center gap-4">
-                        <img src={account.avatarUrl || 'https://picsum.photos/150'} className="w-10 h-10 rounded-full object-cover border border-neutral-700 shadow-sm group-hover:scale-110 transition-transform" alt="avatar" />
-                        <div>
-                          <p className="text-[14px] font-bold text-white tracking-wide">{account.threadsUsername || account.username}</p>
-                          <p className="text-[12px] text-neutral-400 font-medium">{account.name || account.threadsUsername}</p>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 text-[14px] font-bold text-white">{(account.followers || 0).toLocaleString()}</td>
-                      <td className="px-6 py-4 text-[14px] font-bold text-white">{account.engagement || 0}%</td>
-                      <td className="px-6 py-4">
-                        {account.status === 'active' && <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"><CheckCircle2 className="w-3 h-3 mr-1.5" />ACTIVE</span>}
-                        {account.status === 'paused' && <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-neutral-800 border border-neutral-700 text-neutral-400"><PauseCircle className="w-3 h-3 mr-1.5" />PAUSED</span>}
-                        {account.status === 'error' && <span className="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-bold bg-rose-500/10 border border-rose-500/20 text-rose-400"><AlertTriangle className="w-3 h-3 mr-1.5" />ERROR</span>}
-                      </td>
-                    </tr>
-                  ))}
-                  {accounts.length === 0 && (
-                    <tr>
-                      <td colSpan="4" className="px-6 py-8 text-center text-neutral-500 font-medium">アカウントがまだ登録されていません</td>
-                    </tr>
-                  )}
-                </tbody>
-              </table>
+            <div className="flex-1 w-full h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={chartData}>
+                  <defs>
+                    <linearGradient id="colorViews" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#8b5cf6" stopOpacity={0.3}/>
+                      <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                  <XAxis dataKey="date" stroke="#525252" fontSize={11} tickLine={false} axisLine={false} />
+                  <YAxis stroke="#525252" fontSize={11} tickLine={false} axisLine={false} tickFormatter={(val) => val >= 1000 ? `${val/1000}k` : val} />
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#171717', border: '1px solid #262626', borderRadius: '12px', fontSize: '11px' }}
+                    itemStyle={{ color: '#f5f5f5' }}
+                  />
+                  <Area type="monotone" dataKey="views" stroke="#8b5cf6" strokeWidth={3} fillOpacity={1} fill="url(#colorViews)" />
+                </AreaChart>
+              </ResponsiveContainer>
             </div>
           </div>
 
-          <div className="glass-panel rounded-3xl flex flex-col h-full overflow-hidden">
-            <div className="p-6 border-b border-neutral-800/80 bg-neutral-900/50">
-              <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                <Activity className="w-5 h-5 text-indigo-400" />
-                システムログ
-              </h3>
+          <div className="glass-panel p-8 rounded-[2rem] border-neutral-800/40 bg-neutral-900/30 min-h-[400px] flex flex-col">
+            <div className="flex items-center justify-between mb-8 px-2">
+              <h4 className="text-[12px] font-bold text-neutral-400 tracking-widest uppercase flex items-center gap-3">
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-500"></span>
+                ENGAGEMENT BREAKDOWN
+              </h4>
             </div>
-            <div className="p-6 flex-1 overflow-y-auto">
-              <div className="space-y-6">
-                {recentActivities.map((activity, index) => (
-                  <div key={activity.id} className="flex relative">
-                    {index !== recentActivities.length - 1 && (
-                      <div className="absolute top-8 left-[15px] bottom-[-24px] w-[2px] bg-neutral-800/50"></div>
-                    )}
-                    <div className={`relative z-10 w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 mt-1 shadow-md border ${activity.type === 'success' ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-400' :
-                        activity.type === 'error' ? 'bg-rose-500/10 border-rose-500/20 text-rose-400' : 'bg-amber-500/10 border-amber-500/20 text-amber-400'
-                      }`}>
-                      {activity.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> :
-                        activity.type === 'error' ? <AlertTriangle className="w-4 h-4" /> : <Clock className="w-4 h-4" />}
-                    </div>
-                    <div className="ml-4 flex-1">
-                      <p className="text-[13px] font-bold text-white">{activity.action}</p>
-                      <div className="flex items-center mt-1.5 gap-2">
-                        <span className="text-[11px] font-bold text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-2 py-0.5 rounded-md">@{activity.account}</span>
-                        <span className="text-[11px] font-medium text-neutral-500">{activity.time}</span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
+            <div className="flex-1 w-full h-[300px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={engagementData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#262626" vertical={false} />
+                  <XAxis dataKey="name" stroke="#525252" fontSize={11} tickLine={false} axisLine={false} />
+                  <Tooltip 
+                    cursor={{fill: '#262626'}}
+                    contentStyle={{ backgroundColor: '#171717', border: '1px solid #262626', borderRadius: '12px', fontSize: '11px' }}
+                  />
+                  <Bar dataKey="value" radius={[10, 10, 0, 0]}>
+                    {engagementData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.color} opacity={0.8} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Sub-component for individual Metric Cards
+const MetricCard = ({ label, value, icon, color, trend }) => {
+  const colorMap = {
+    violet: 'text-violet-400 bg-violet-500/10 border-violet-500/20',
+    blue: 'text-blue-400 bg-blue-500/10 border-blue-500/20',
+    pink: 'text-pink-400 bg-pink-500/10 border-pink-500/20',
+    emerald: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20',
+    yellow: 'text-yellow-400 bg-yellow-500/10 border-yellow-500/20',
+  };
+
+  return (
+    <div className="glass-panel p-6 rounded-[1.5rem] flex flex-col justify-between group border-neutral-800/40 bg-neutral-900/30 shadow-lg hover:bg-neutral-900/40 transition-all duration-500">
+      <div className="flex justify-between items-start">
+        <div className="flex-1">
+          <p className="text-[11px] font-bold text-neutral-500 tracking-[0.2em] uppercase opacity-70 mb-2">{label}</p>
+          <div className="flex items-baseline gap-2">
+            <h4 className="text-3xl font-bold text-white tracking-tight">{(value || 0).toLocaleString()}</h4>
+            {trend && <span className="text-[10px] font-bold text-emerald-500/80 ml-1">{trend}</span>}
+          </div>
+        </div>
+        <div className={`p-3 rounded-2xl border transition-all duration-500 ${colorMap[color]}`}>
+          {icon}
         </div>
       </div>
     </div>
@@ -1909,6 +2089,11 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
   const [nextRun, setNextRun] = useState(null);
   const [aiProvider, setAiProvider] = useState('gemini');
   const [aiModel, setAiModel] = useState('gemini-1.5-flash');
+  const [geminiApiKey, setGeminiApiKey] = useState('');
+  const [openaiApiKey, setOpenaiApiKey] = useState('');
+  const [anthropicApiKey, setAnthropicApiKey] = useState('');
+  const [manusApiKey, setManusApiKey] = useState('');
+  const [threadsApiKey, setThreadsApiKey] = useState('');
   const [useImageGen, setUseImageGen] = useState(false);
   const [imagePrompt, setImagePrompt] = useState("投稿内容を視覚的に表現した、スタイリッシュなSNS向けの画像");
   const [useTrends, setUseTrends] = useState(false);
@@ -1919,6 +2104,7 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
   const [engageCount, setEngageCount] = useState(3);
   const [engageReplyPrompt, setEngageReplyPrompt] = useState("共感や肯定的な反応を示しつつ、自然な日本語で返信してください。");
   const [currentTrends, setCurrentTrends] = useState([]);
+  const [isTestingThreads, setIsTestingThreads] = useState(false);
   const [useAutoDM, setUseAutoDM] = useState(false);
   const [dmContent, setDmContent] = useState("返信ありがとうございます！詳細はこちらのリンクからご確認ください。");
   const [useNoteAutoPost, setUseNoteAutoPost] = useState(false);
@@ -1957,6 +2143,11 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
       setUseNoteAutoPost(settings.useNoteAutoPost || false);
       setDmContent(settings.dmContent || "返信ありがとうございます！詳細はこちらのリンクからご確認ください。");
       setIntervalMin(settings.intervalMin || 60);
+      setGeminiApiKey(settings.geminiApiKey || '');
+      setOpenaiApiKey(settings.openaiApiKey || '');
+      setAnthropicApiKey(settings.anthropicApiKey || '');
+      setManusApiKey(settings.manusApiKey || '');
+      setThreadsApiKey(settings.threadsApiKey || '');
     }
   }, [selectedAccount]);
 
@@ -1966,8 +2157,11 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
     const updatedSettings = {
       theme, tone, promptText, target, benefits, keywords, exclusions, useEmojis, postFormat,
       useTrends, trendKeyword, useAutoEngage, engageKeywords, engageAction, engageCount, engageReplyPrompt,
-      useAutoDM, dmContent, useNoteAutoPost
+      useAutoDM, dmContent, useNoteAutoPost,
+      geminiApiKey, openaiApiKey, anthropicApiKey, manusApiKey, threadsApiKey
     };
+
+
 
     const accountsDB = JSON.parse(localStorage.getItem('threadsAccountsDB') || '[]');
     const updatedDB = accountsDB.map(acc => {
@@ -1996,14 +2190,34 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
     }
     setIsTesting(true);
     const keyMap = {
-      gemini: localStorage.getItem('geminiApiKey'),
-      openai: localStorage.getItem('openaiApiKey'),
-      anthropic: localStorage.getItem('anthropicApiKey'),
-      manus: localStorage.getItem('manusApiKey')
+      gemini: geminiApiKey || localStorage.getItem('geminiApiKey'),
+      openai: openaiApiKey || localStorage.getItem('openaiApiKey'),
+      anthropic: anthropicApiKey || localStorage.getItem('anthropicApiKey'),
+      manus: manusApiKey || localStorage.getItem('manusApiKey')
     };
     const result = await callAI(aiProvider, keyMap[aiProvider], aiModel, buildPromptWithLocal());
     setTestResult(result);
     setIsTesting(false);
+  };
+
+  const handleTestThreadsAPI = async () => {
+    if (!threadsApiKey) {
+      alert("Threads API Key（アクセストークン）を入力してください。");
+      return;
+    }
+    setIsTestingThreads(true);
+    try {
+      const result = await apiService.testThreadsConnection(threadsApiKey);
+      if (result.success) {
+        alert(`🎉 接続成功！\nアカウント: @${result.username}\nID: ${result.id}\n\nこのキーで自動投稿とインサイト取得が可能です。`);
+      } else {
+        alert(`❌ 接続失敗\nエラー: ${result.error}\n\nトークンが正しいか、有効期限が切れていないか確認してください。`);
+      }
+    } catch (e) {
+      alert(`エラーが発生しました: ${e.message}`);
+    } finally {
+      setIsTestingThreads(false);
+    }
   };
 
   return (
@@ -2271,6 +2485,77 @@ const AutoPilotView = ({ accounts, onAccountsUpdate }) => {
                       </select>
                     </div>
                   </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6 p-6 bg-neutral-950/40 rounded-3xl border border-neutral-800/50">
+                    <div className="md:col-span-2">
+                       <h5 className="text-[11px] font-bold text-violet-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                         <Key className="w-3.5 h-3.5" /> API接続キー (このアカウント専用)
+                       </h5>
+                       <p className="text-[10px] text-neutral-500 mb-4">* 未入力の場合は「システム設定」の共通キーが使用されます。</p>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-2 uppercase">Gemini API Key</label>
+                      <input
+                        type="password"
+                        value={geminiApiKey}
+                        onChange={(e) => setGeminiApiKey(e.target.value)}
+                        placeholder="AI-..."
+                        className="w-full p-3 bg-neutral-900/50 border border-neutral-700/50 rounded-xl text-xs text-white focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-2 uppercase">OpenAI API Key</label>
+                      <input
+                        type="password"
+                        value={openaiApiKey}
+                        onChange={(e) => setOpenaiApiKey(e.target.value)}
+                        placeholder="sk-..."
+                        className="w-full p-3 bg-neutral-900/50 border border-neutral-700/50 rounded-xl text-xs text-white focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-2 uppercase">Anthropic API Key</label>
+                      <input
+                        type="password"
+                        value={anthropicApiKey}
+                        onChange={(e) => setAnthropicApiKey(e.target.value)}
+                        placeholder="sk-ant-..."
+                        className="w-full p-3 bg-neutral-900/50 border border-neutral-700/50 rounded-xl text-xs text-white focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-neutral-400 mb-2 uppercase">Manus API Key</label>
+                      <input
+                        type="password"
+                        value={manusApiKey}
+                        onChange={(e) => setManusApiKey(e.target.value)}
+                        placeholder="manus-..."
+                        className="w-full p-3 bg-neutral-900/50 border border-neutral-700/50 rounded-xl text-xs text-white focus:outline-none focus:border-violet-500/50"
+                      />
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <label className="block text-[11px] font-bold text-neutral-400 uppercase">Threads (Official) API Key</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          value={threadsApiKey}
+                          onChange={(e) => setThreadsApiKey(e.target.value)}
+                          placeholder="Threads Access Token..."
+                          className="flex-1 p-3 bg-neutral-900/50 border border-neutral-700/50 rounded-xl text-xs text-white focus:outline-none focus:border-violet-500/50"
+                        />
+                        <button
+                          onClick={handleTestThreadsAPI}
+                          disabled={isTestingThreads || !threadsApiKey}
+                          className="px-4 py-2 bg-indigo-500/20 text-indigo-400 border border-indigo-500/20 rounded-xl text-[11px] font-bold hover:bg-indigo-500/30 transition-all disabled:opacity-30 flex items-center gap-2"
+                        >
+                          {isTestingThreads ? <RefreshCw className="w-3 h-3 animate-spin" /> : <ShieldCheck className="w-3 h-3" />}
+                          接続テスト
+                        </button>
+                      </div>
+                      <p className="text-[9px] text-neutral-500 mt-0.5 ml-1">※公式APIを利用する場合は「長期トークン」を入力してください。<br/>取得方法は「使用方法」または「threads_api_guide.md」を参照してください。</p>
+                    </div>
+                  </div>
+
 
                   <div className="mt-8 space-y-6">
                     <div className="flex items-center justify-between glass-panel p-4 rounded-2xl border border-neutral-800/50">
@@ -2551,7 +2836,8 @@ const SchedulerView = ({ accounts }) => {
       const credentials = {
         username: targetAccount.threadsUsername,
         password: targetAccount.threadsPassword,
-        proxy: targetAccount.proxy
+        proxy: targetAccount.proxy,
+        threadsApiKey: targetAccount.personaSettings?.threadsApiKey
       };
 
       const res = await apiService.postToThreads(targetAccount.id, credentials, contentToPost, null);
@@ -2826,10 +3112,16 @@ const QuickPostView = ({ accounts, addLog, isElectron, isMobile }) => {
       // Post to Threads
       const threadsRes = await apiService.postToThreads(
         acc.id,
-        { username: acc.threadsUsername, password: acc.threadsPassword, proxy: acc.proxy },
+        { 
+          username: acc.threadsUsername, 
+          password: acc.threadsPassword, 
+          proxy: acc.proxy,
+          threadsApiKey: acc.personaSettings?.threadsApiKey
+        },
         content,
         null
       );
+
       
       if (threadsRes.success) {
         successCount++;
@@ -3580,7 +3872,7 @@ const MyPageView = ({ currentUser, onRefresh }) => {
 };
 
 // ビュー: 認証ガード (Login / Register / License)
-const AuthScreen = ({ onLogin }) => {
+const AuthScreen = ({ onLogin, onCancel }) => {
   const [mode, setMode] = useState('login'); // login, register, license
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
@@ -3597,22 +3889,65 @@ const AuthScreen = ({ onLogin }) => {
     if (mode === 'login') {
       // マスター管理者用の上書きルート（ユーザー様のご本人アカウント情報）
       if ((username === 'onecabigon@gmail.com' || username === 'admin') && password === 'sausu2108') {
+        try {
+          await signInWithEmailAndPassword(auth, 'onecabigon@gmail.com', password);
+        } catch(e) {}
         onLogin({ username: 'onecabigon@gmail.com', role: 'admin', license: 'MASTER-KEY', plan: 'enterprise' });
         return;
       }
 
-      // ユーザー名またはメールアドレスで検索
-      const user = usersDB.find(u => (u.username === username || u.email === username) && u.password === password);
-      if (user) {
-        if (!user.license && user.role !== 'admin') {
-          setMode('license');
-        } else {
-          // Ensure role: admin always has a plan
-          if (user.role === 'admin' && !user.plan) user.plan = 'enterprise';
-          onLogin(user);
+      try {
+        let loginEmail = username;
+
+        // もし入力されたのがメールアドレス形式(@を含む)でない場合は、ユーザー名として扱い licenses コレクションからメールを引く
+        if (!username.includes('@')) {
+          const qByUsername = query(collection(db, "licenses"), where("usedBy", "==", username));
+          const snap = await getDocs(qByUsername);
+          if (!snap.empty) {
+            loginEmail = snap.docs[0].data().usedByEmail;
+          } else {
+            setError('ユーザー名が見つかりません。');
+            return;
+          }
         }
-      } else {
-        setError('ユーザー名/メールアドレスまたはパスワードが間違っています。');
+
+        // Firebase Authで実際のログインを実行
+        const userCred = await signInWithEmailAndPassword(auth, loginEmail, password);
+
+        // ログイン成功後、プロフィール情報をlicensesから取得してアプリ内状態にセット
+        const qByEmail = query(collection(db, "licenses"), where("usedByEmail", "==", loginEmail));
+        const snap = await getDocs(qByEmail);
+        
+        if (!snap.empty) {
+          const licData = snap.docs[0].data();
+          const cloudUser = { 
+            username: licData.usedBy || loginEmail.split('@')[0], 
+            email: loginEmail, 
+            password: password, 
+            role: 'user', 
+            license: licData.key, 
+            plan: licData.plan || 'pro',
+            licenseType: licData.type || '30days',
+            activatedAt: licData.activatedAt || new Date().toISOString()
+          };
+          
+          // ローカルの usersDB も更新・保持しておく（既存レガシー処理との互換用）
+          const existingIdx = usersDB.findIndex(u => u.username === cloudUser.username || u.email === loginEmail);
+          if (existingIdx >= 0) {
+            usersDB[existingIdx] = cloudUser;
+          } else {
+            usersDB.push(cloudUser);
+          }
+          localStorage.setItem('usersDB', JSON.stringify(usersDB));
+          
+          onLogin(cloudUser);
+        } else {
+          // 万が一 licenses に見つからなくても Auth は通ったので最低限の権限でログイン
+          onLogin({ username: loginEmail.split('@')[0], email: loginEmail, role: 'user', plan: 'trial' });
+        }
+      } catch (e) {
+        console.error("Firebase Login Error: ", e);
+        setError('ログインに失敗しました。メールアドレス/ユーザー名かパスワードが間違っています。');
       }
     } else if (mode === 'register') {
       if (usersDB.find(u => u.username === username)) {
@@ -3633,51 +3968,29 @@ const AuthScreen = ({ onLogin }) => {
           const licDoc = querySnapshot.docs[0];
           const licData = licDoc.data();
           
-          // ライセンス復旧のロジック:
-          // すでに使用済みでも、登録時のユーザー名/アカウント情報とパスワードが一致すれば再アクティベートを許可
-          const isRecovery = licData.used && (licData.usedBy === username || licData.usedByEmail === email) && (licData.password === password);
-          
-          if (!licData.used || isRecovery) {
-            // Mark license as used in Firestore and save password for future recovery
+          if (!licData.used) {
+            // New creation in Firebase Auth
+            await createUserWithEmailAndPassword(auth, email, password);
+            
+            // Mark license as used in Firestore
             await updateDoc(doc(db, "licenses", licDoc.id), {
               used: true,
               usedBy: username,
-              usedByEmail: email || 'legacy_user',
-              password: password, // recovery用
-              activatedAt: licData.activatedAt || new Date().toISOString()
+              usedByEmail: email,
+              password: password,
+              activatedAt: new Date().toISOString()
             });
-
-            // Save user locally
-            let user = usersDB.find(u => u.username === username);
-            if (!user) {
-              user = { 
-                username, email, password, role: 'user', 
-                license: licenseKey, 
-                plan: licData.plan || 'pro',
-                licenseType: licData.type || '30days',
-                activatedAt: licData.activatedAt || new Date().toISOString()
-              };
-              usersDB.push(user);
-              localStorage.setItem('usersDB', JSON.stringify(usersDB));
-            } else {
-              user.email = email;
-              user.license = licenseKey;
-              user.plan = licData.plan || 'pro';
-              user.licenseType = licData.type || '30days';
-              user.activatedAt = licData.activatedAt || new Date().toISOString();
-              user.password = password;
-              localStorage.setItem('usersDB', JSON.stringify(usersDB));
-            }
-            onLogin(user);
+            
+            // App will auto-login via onAuthStateChanged
           } else {
-            setError('このライセンスキーは既に使用されています。');
+            setError('このライセンスキーは既に他のユーザーに使用されています。');
           }
         } else {
           setError('無効なライセンスキーです。');
         }
       } catch (e) {
-        console.error("Firestore error: ", e);
-        setError('認証サーバーとの通信に失敗しました。再度お試しください。');
+        console.error("License logic error: ", e);
+        setError(e.message || '認証サーバーとの通信に失敗しました。');
       }
     }
   };
@@ -3688,6 +4001,20 @@ const AuthScreen = ({ onLogin }) => {
       <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] bg-indigo-900/10 rounded-full blur-[120px] pointer-events-none"></div>
 
       <div className="glass-panel w-full max-w-md p-10 rounded-[2.5rem] relative z-10 shadow-2xl border border-neutral-800/80">
+        {(mode !== 'login' || onCancel) && (
+          <button 
+            onClick={() => {
+              if (mode === 'register') setMode('login');
+              else if (mode === 'license') setMode('register');
+              else if (onCancel) onCancel();
+              setError('');
+            }}
+            className="absolute top-8 left-8 p-2 bg-neutral-900/50 border border-neutral-800 rounded-xl text-neutral-400 hover:text-white transition-all group z-50"
+            title={mode === 'login' ? "アプリに戻る" : "戻る"}
+          >
+            <ChevronLeft className="w-5 h-5 group-hover:-translate-x-0.5 transition-transform" />
+          </button>
+        )}
         <div className="flex flex-col items-center mb-8">
           <img src={appLogo} alt="thpro by cabi Logo" className="w-56 h-auto object-contain mb-2 drop-shadow-[0_0_15px_rgba(212,175,55,0.3)]" />
           <h1 className="text-xl font-bold text-white tracking-widest uppercase mt-4 hidden">thpro bycabi</h1>
@@ -3995,6 +4322,61 @@ const UsageGuideView = ({ onNavigate }) => {
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )
+    },
+    {
+      id: 'threads_api',
+      title: "Threads公式APIの取得",
+      icon: <Send className="w-5 h-5 text-indigo-400" />,
+      content: (
+        <div className="space-y-6">
+          <div className="p-8 bg-neutral-900/50 border border-neutral-800 rounded-[2.5rem] relative overflow-hidden group">
+            <h4 className="font-bold text-white flex items-center gap-3 mb-4">
+              <div className="p-2.5 bg-indigo-500/20 rounded-2xl text-indigo-400 shadow-inner"><Key className="w-5 h-5" /></div>
+              【超かんたん】API取得の６ステップ
+            </h4>
+            <div className="mb-6 p-4 bg-indigo-500/5 border border-indigo-500/10 rounded-2xl">
+              <p className="text-[11px] text-indigo-300 font-bold mb-2 flex items-center gap-2">
+                <CheckCircle2 className="w-3.5 h-3.5" /> 準備するもの
+              </p>
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wider font-bold">Facebookアカウント、パソコン、スマートフォン</p>
+            </div>
+            
+            <div className="space-y-6">
+              {[
+                { step: "01", title: "Metaアプリを作る", desc: "Meta for Developersで「その他」→「ビジネス」を選んで名前を決めるだけ！" },
+                { step: "02", title: "ウェブ設定を追加", desc: "アプリ設定で「ウェブ」を選び、ThreadsのURLを入力して保存します。" },
+                { step: "03", title: "Threadsを追加", desc: "プロダクト追加で「Threads」のボタンをポチッと押します。" },
+                { step: "04", title: "スマホで「承認」", desc: "★重要：Threadsアプリ設定の「ウェブサイトのアクセス許可」から必ず承認してください。" },
+                { step: "05", title: "トークンをコピー", desc: "Generate Tokenからログインし、一番長いコードをコピーします。" },
+                { step: "06", title: "アプリに貼る", desc: "「エンジン設定」のAPIキー欄に貼り付ければ、自動運用の準備完了です！" }
+              ].map((s, i) => (
+                <div key={i} className="flex gap-4">
+                  <div className="flex-shrink-0 w-8 h-8 bg-neutral-800 rounded-lg flex items-center justify-center text-[11px] font-bold text-indigo-400 border border-neutral-700">
+                    {s.step}
+                  </div>
+                  <div>
+                    <h5 className="text-[14px] font-bold text-white mb-1">{s.title}</h5>
+                    <p className="text-[11px] text-neutral-400 leading-relaxed font-medium">{s.desc}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+            
+            <div className="mt-8 p-6 bg-rose-500/5 border border-rose-500/10 rounded-2xl">
+              <h5 className="text-[12px] font-bold text-rose-400 mb-2 flex items-center gap-2">
+                <Users className="w-4 h-4" /> 複数アカウントの場合
+              </h5>
+              <p className="text-[10px] text-neutral-400 leading-relaxed font-medium">
+                各アカウントごとに「専用の鍵（トークン）」が必要です。2つ目以降を設定するときは、一度ブラウザのFacebookをログアウトし、別のアカウントでログインし直してからステップ1を実行してください。
+              </p>
+            </div>
+            
+            <p className="mt-8 text-[10px] text-neutral-500 leading-relaxed italic text-center font-medium">
+              ※さらに詳しい画像付きの解説は「threads_api_guide.md」をチェック！
+            </p>
           </div>
         </div>
       )
@@ -5001,13 +5383,72 @@ const CloudAutomationView = ({ currentUser, accounts }) => {
 };
 
 export default function App() {
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        // Authenticated. Now fetch license & profile data from Firestore.
+        try {
+          const email = user.email;
+          const licensesRef = collection(db, "licenses");
+          const q = query(licensesRef, where("usedByEmail", "==", email));
+          const snap = await getDocs(q);
+          
+          if (!snap.empty) {
+            const licData = snap.docs[0].data();
+            const userData = {
+               uid: user.uid,
+               username: licData.usedBy || email.split('@')[0],
+               email: email,
+               role: (email === 'onecabigon@gmail.com' || licData.usedBy === 'admin') ? 'admin' : 'user',
+               license: licData.key,
+               plan: licData.plan || (email === 'onecabigon@gmail.com' ? 'enterprise' : 'pro'),
+               licenseType: licData.type || '30days',
+               activatedAt: licData.activatedAt
+            };
+            setCurrentUser(userData);
+            localStorage.setItem('currentUser', JSON.stringify(userData));
+            setIsSwitchingUser(false);
+          } else if (email === 'onecabigon@gmail.com') {
+            // Master Admin fallback
+            const adminData = {
+              uid: user.uid,
+              username: 'onecabigon@gmail.com',
+              email: email,
+              role: 'admin',
+              license: 'MASTER-KEY',
+              plan: 'enterprise'
+            };
+            setCurrentUser(adminData);
+            localStorage.setItem('currentUser', JSON.stringify(adminData));
+            setIsSwitchingUser(false);
+          }
+        } catch (e) {
+          console.error("Auth listener error:", e);
+        }
+      } else {
+        setCurrentUser(null);
+        localStorage.removeItem('currentUser');
+        setIsSwitchingUser(false);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [currentUser, setCurrentUser] = useState(null); // null means not logged in
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('currentUser');
+      return saved ? JSON.parse(saved) : null;
+    } catch(e) { return null; }
+  });
+  const [isSwitchingUser, setIsSwitchingUser] = useState(false);
   const [rawAccounts, setRawAccounts] = useState([]);
   const [announcement, setAnnouncement] = useState('');
   const [isBlocked, setIsBlocked] = useState(false);
   const [blockReason, setBlockReason] = useState('');
   const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+  const [showSwitchModal, setShowSwitchModal] = useState(false);
+  const [cachedUsers, setCachedUsers] = useState(JSON.parse(localStorage.getItem('usersDB') || '[]'));
   
   // Mobile & Platform Detection
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -5034,7 +5475,7 @@ export default function App() {
     if (currentUser) {
       // 1. Initial Local Load (Fast First Paint)
       try {
-        const savedRaw = localStorage.getItem('threadsAccountsDB');
+        const savedRaw = localStorage.getItem(`threadsAccountsDB_${currentUser.username}`);
         let saved = [];
         if (savedRaw) {
           try {
@@ -5057,12 +5498,12 @@ export default function App() {
           setIsCloudSyncing(true);
           const cloudAccounts = docSnap.data().accounts || [];
           setRawAccounts(cloudAccounts);
-          localStorage.setItem('threadsAccountsDB', JSON.stringify(cloudAccounts));
+          localStorage.setItem(`threadsAccountsDB_${userId}`, JSON.stringify(cloudAccounts));
           addLog("Cloud Sync: Accounts updated from server.");
           setTimeout(() => setIsCloudSyncing(false), 1000);
         } else {
           // If no cloud data yet, and we have local data, migrate it!
-          const localRaw = localStorage.getItem('threadsAccountsDB');
+          const localRaw = localStorage.getItem(`threadsAccountsDB_${userId}`);
           if (localRaw) {
             try {
               const localParsed = JSON.parse(localRaw);
@@ -5166,14 +5607,36 @@ export default function App() {
     }
   }, [currentUser?.license]);
 
-  const handleLogout = () => {
-    setCurrentUser(null);
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      if (currentUser) {
+        localStorage.removeItem(`threadsAccountsDB_${currentUser.username}`);
+      }
+      setRawAccounts([]);
+      setActiveTab('dashboard');
+    } catch (e) {
+      console.error("Logout error:", e);
+    }
+  };
+
+  const handleSwitchUser = (user) => {
+    if (currentUser) {
+      localStorage.removeItem(`threadsAccountsDB_${currentUser.username}`);
+    }
+    setRawAccounts([]);
+    setCurrentUser(user);
+    setShowSwitchModal(false);
     setActiveTab('dashboard');
+    // Save to localStorage so it's prioritized
+    localStorage.setItem('currentUser', JSON.stringify(user));
   };
 
   const handleUpdateAccounts = async (newData) => {
     setRawAccounts(newData);
-    localStorage.setItem('threadsAccountsDB', JSON.stringify(newData));
+    if (currentUser) {
+      localStorage.setItem(`threadsAccountsDB_${currentUser.username}`, JSON.stringify(newData));
+    }
     
     // Push to Cloud if logged in
     if (currentUser) {
@@ -5212,8 +5675,14 @@ export default function App() {
     );
   }
 
-  if (!currentUser) {
-    return <AuthScreen onLogin={(user) => setCurrentUser(user)} />;
+  if (!currentUser || isSwitchingUser) {
+    return <AuthScreen 
+      onLogin={(user) => {
+        setCurrentUser(user);
+        setIsSwitchingUser(false);
+      }} 
+      onCancel={currentUser ? () => setIsSwitchingUser(false) : null}
+    />;
   }
 
   const navItems = [
@@ -5222,7 +5691,7 @@ export default function App() {
     { id: 'quickpost', label: '新規投稿', icon: <Send className="w-5 h-5" /> },
     { id: 'accounts', label: 'ノード管理', icon: <Users className="w-5 h-5" /> },
     { id: 'note_guide', label: 'note.com 連携', icon: <Globe className="w-5 h-5 text-emerald-400" /> },
-    { id: 'autopilot', label: 'エンジン設定', icon: <Bot className="w-5 h-5" /> },
+    { id: 'autopilot', label: 'エンジン設定 (AutoPilot)', icon: <Bot className="w-5 h-5" /> },
     { id: 'note_mgmt', label: 'note (大画面)', icon: <Layout className="w-5 h-5 text-emerald-400" /> },
     { id: 'scheduler', label: 'キュー（予約）', icon: <CalendarClock className="w-5 h-5" /> },
     { id: 'usage_guide', label: '使用方法', icon: <MessageCircle className="w-5 h-5 text-amber-400" /> },
@@ -5236,7 +5705,8 @@ export default function App() {
 
   // Plan-based feature gating
   const filteredNavItems = navItems.filter(item => {
-    const planId = currentUser.plan || 'entry';
+    if (currentUser.role === 'admin') return true;
+    const planId = currentUser.plan || 'pro';
     const planData = SUBSCRIPTION_PLANS[planId] || SUBSCRIPTION_PLANS.entry;
     
     // Trial plan: Strictly limited to basic views
@@ -5321,6 +5791,13 @@ export default function App() {
                   {currentUser.role === 'admin' ? 'ADMINISTRATOR' : 'LICENSED USER'}
                 </span>
               </div>
+              <button 
+                onClick={(e) => { e.stopPropagation(); setCachedUsers(JSON.parse(localStorage.getItem('usersDB') || '[]')); setShowSwitchModal(true); }}
+                className="ml-auto p-2 hover:bg-white/10 rounded-xl transition-colors text-neutral-500 hover:text-white"
+                title="アカウント切り替え"
+              >
+                <RefreshCw className="w-4 h-4" />
+              </button>
             </div>
           </div>
           <button onClick={handleLogout} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl bg-neutral-800 hover:bg-rose-500/20 hover:text-rose-400 text-neutral-400 text-[12px] font-bold transition-colors border border-transparent hover:border-rose-500/30 group">
@@ -5395,6 +5872,57 @@ export default function App() {
         </div>
       </main>
       <AutomationEngine accounts={rawAccounts} onAccountsUpdate={handleUpdateAccounts} />
+      
+      {/* Account Switcher Modal */}
+      {showSwitchModal && (
+        <div className="fixed inset-0 z-[300] flex items-center justify-center bg-black/80 backdrop-blur-md p-4 animate-in fade-in duration-300">
+           <div className="glass-panel w-full max-w-sm rounded-[2.5rem] border border-neutral-800 shadow-2xl relative overflow-hidden">
+              <div className="p-8 border-b border-neutral-800/50 flex justify-between items-center bg-neutral-900/40">
+                 <h3 className="text-sm font-bold text-white uppercase tracking-widest flex items-center gap-2">
+                    <Users className="w-4 h-4 text-violet-400" /> アカウント切り替え
+                 </h3>
+                 <button onClick={() => setShowSwitchModal(false)} className="text-neutral-500 hover:text-white transition-colors">
+                    <X className="w-5 h-5" />
+                 </button>
+              </div>
+              <div className="p-4 max-h-[60vh] overflow-y-auto space-y-2 custom-scrollbar">
+                 {cachedUsers.map((user, idx) => (
+                    <button 
+                      key={idx}
+                      onClick={() => handleSwitchUser(user)}
+                      className={`w-full flex items-center justify-between p-4 rounded-2xl border transition-all ${
+                        currentUser?.username === user.username 
+                        ? 'bg-violet-600 border-violet-500 text-white shadow-lg' 
+                        : 'bg-neutral-900/50 border-neutral-800 text-neutral-400 hover:bg-neutral-800 hover:text-white'
+                      }`}
+                    >
+                      <div className="flex items-center gap-3">
+                         <div className={`w-8 h-8 rounded-full flex items-center justify-center text-[10px] font-bold ${currentUser?.username === user.username ? 'bg-white/20' : 'bg-neutral-800 border border-neutral-700'}`}>
+                            {user.username.substring(0,2).toUpperCase()}
+                         </div>
+                         <div className="text-left">
+                            <p className="text-sm font-bold leading-none mb-1">{user.username}</p>
+                            <p className={`text-[10px] uppercase tracking-widest font-bold ${currentUser?.username === user.username ? 'text-violet-200' : 'text-neutral-600'}`}>{user.plan || 'Plan Info'}</p>
+                         </div>
+                      </div>
+                      {currentUser?.username === user.username && <CheckCircle2 className="w-4 h-4" />}
+                    </button>
+                 ))}
+                 
+                 <button 
+                   onClick={() => { setIsSwitchingUser(true); setShowSwitchModal(false); }}
+                   className="w-full flex items-center gap-4 p-4 rounded-2xl border border-dashed border-neutral-800 text-neutral-500 hover:border-violet-500/50 hover:text-violet-400 transition-all text-sm font-bold"
+                 >
+                    <Plus className="w-4 h-4" /> 新しいアカウントでログイン
+                 </button>
+              </div>
+              <div className="p-6 bg-neutral-900/20 text-center">
+                 <p className="text-[10px] text-neutral-600 font-medium">現在このデバイスでアクティブなユーザー一覧です。</p>
+              </div>
+           </div>
+        </div>
+      )}
+
       </div>
     </div>
   );

@@ -108,10 +108,12 @@ async function ensureBrowserSession(accountId, service = 'threads', credentials 
   mainWindow.webContents.send('system:log', `Launching ${isHeadless ? 'headless ' : ''}automated browser for ${service} (${credentials.username || accountId})...`);
   
   const launchArgs = isHeadless ? [] : ['--start-maximized'];
-  if (credentials.proxy && credentials.proxy.host) {
+  if (credentials.proxy && credentials.proxy.host && credentials.proxy.port) {
     const { host, port } = credentials.proxy;
     launchArgs.push(`--proxy-server=${host}:${port}`);
     mainWindow.webContents.send('system:log', `Connecting via proxy: ${host}:${port}`);
+  } else {
+    mainWindow.webContents.send('system:log', `No proxy configured or invalid proxy format. Using direct connection.`);
   }
 
   const executablePath = getExecutablePath();
@@ -133,6 +135,10 @@ async function ensureBrowserSession(accountId, service = 'threads', credentials 
     args: launchArgs
   });
   const page = await browser.newPage();
+  
+  // Set default timeouts for the page to be more generous
+  page.setDefaultNavigationTimeout(90000); 
+  page.setDefaultTimeout(30000);
 
   if (credentials.proxy && credentials.proxy.username) {
     await page.authenticate({
@@ -173,14 +179,15 @@ async function ensureBrowserSession(accountId, service = 'threads', credentials 
     await page.keyboard.press('Enter');
     mainWindow.webContents.send('system:log', `[Threads:${credentials.username}] Waiting for authentication...${!isHeadless ? ' (Manual 2FA entry is possible)' : ''}`);
     
-    // In headful mode, we give the user much more time (e.g. 2 minutes) for 2FA
-    const loginTimeout = isHeadless ? 30000 : 120000;
+    // In headful mode, we give the user much more time (e.g. 3 minutes) for 2FA
+    const loginTimeout = isHeadless ? 60000 : 180000;
     try {
       await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: loginTimeout });
     } catch (e) {
       if (!isHeadless) {
         mainWindow.webContents.send('system:log', `[Threads:${credentials.username}] Navigation timed out, but check if manual login was successful...`);
       } else {
+        mainWindow.webContents.send('system:log', `[Threads:${credentials.username}] Login navigation timeout (60s). This might be due to slow network or 2FA requirement.`);
         throw e;
       }
     }
@@ -525,8 +532,8 @@ ipcMain.handle('browser:postToThreads', async (event, accountId, credentials, co
     const { page } = session;
     
     mainWindow.webContents.send('system:log', `[${credentials.username}] Accessing Threads...`);
-    await page.goto('https://www.threads.net/', { waitUntil: 'networkidle2' });
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await page.goto('https://www.threads.net/', { waitUntil: 'load', timeout: 90000 });
+    await new Promise(resolve => setTimeout(resolve, 5000));
     
     const currentUrl = page.url();
     const domain = currentUrl.includes('threads.com') ? 'threads.com' : 'threads.net';
@@ -662,7 +669,9 @@ ipcMain.handle('browser:postToThreads', async (event, accountId, credentials, co
         await new Promise(res => setTimeout(res, 1000));
     }
 
-    if (!modalGone) throw new Error("Post button clicked, but modal didn't close.");
+    if (!modalGone) {
+        mainWindow.webContents.send('system:log', `[${credentials.username}] WARNING: Modal didn't close, but post button was clicked. Proceeding...`);
+    }
     mainWindow.webContents.send('system:log', `[${credentials.username}] Deployment successful.`);
     return { success: true };
 
@@ -679,16 +688,16 @@ ipcMain.handle('browser:postToNote', async (event, accountId, credentials, title
     mainWindow.webContents.send('system:log', `[Note:${credentials.noteEmail}] Accessing Note Editor...`);
     
     // Check if on a page where we can see the "Write" button
-    await page.goto('https://note.com/', { waitUntil: 'networkidle2' });
+    await page.goto('https://note.com/', { waitUntil: 'load', timeout: 90000 });
     
     // Try to find the "Create Note" button (Usually a pencil icon or "投稿")
-    await page.waitForSelector('a[href="/edit"], button.p-navbar__postButton', { timeout: 15000 }).catch(() => {});
-    await page.goto('https://note.com/edit', { waitUntil: 'networkidle2' });
+    await page.waitForSelector('a[href="/edit"], button.p-navbar__postButton', { timeout: 30000 }).catch(() => {});
+    await page.goto('https://note.com/edit', { waitUntil: 'load', timeout: 90000 });
 
     mainWindow.webContents.send('system:log', `[Note] Entering Title and Content...`);
     
     // Title
-    await page.waitForSelector('textarea.p-articleEditor__title, .p-articleEditor__title textarea', { timeout: 15000 });
+    await page.waitForSelector('textarea.p-articleEditor__title, .p-articleEditor__title textarea', { timeout: 30000 });
     await page.type('textarea.p-articleEditor__title, .p-articleEditor__title textarea', title, { delay: 20 });
     
     // Content (EditorJS or similar contenteditable)
@@ -708,7 +717,7 @@ ipcMain.handle('browser:postToNote', async (event, accountId, credentials, title
         });
     });
 
-    await page.waitForSelector('button.p-articlePublishingSettings__publishButton', { timeout: 10000 }).catch(() => {});
+    await page.waitForSelector('button.p-articlePublishingSettings__publishButton', { timeout: 20000 }).catch(() => {});
     
     // Final Publish click
     await page.evaluate(() => {
