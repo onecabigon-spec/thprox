@@ -515,6 +515,7 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
   const [showEditModal, setShowEditModal] = useState(false);
   const [editUsername, setEditUsername] = useState(account.threadsUsername || account.username || '');
   const [editPassword, setEditPassword] = useState(account.threadsPassword || account.password || '');
+  const [editThreadsApiKey, setEditThreadsApiKey] = useState(account.threadsApiKey || '');
   const [editNoteEmail, setEditNoteEmail] = useState(account.noteEmail || '');
   const [editNotePassword, setEditNotePassword] = useState(account.notePassword || '');
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -523,6 +524,7 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
   useEffect(() => {
     setEditUsername(account.threadsUsername || account.username || '');
     setEditPassword(account.threadsPassword || account.password || '');
+    setEditThreadsApiKey(account.threadsApiKey || '');
     setEditNoteEmail(account.noteEmail || '');
     setEditNotePassword(account.notePassword || '');
   }, [account]);
@@ -535,6 +537,7 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
   const [forcingLogin, setForcingLogin] = useState(false);
   const [loadError, setLoadError] = useState(null);
   const webviewRef = useRef(null);
+  const isManualOverrideRef = useRef(false);
 
   const addLog = (msg, prefix = "") => {
     // 1. Aggressively strip console formatting (%c) and CSS property-value pairs
@@ -585,6 +588,7 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
     const handleConsole = (e) => {
       const msg = e.message;
       if (msg.includes("[STATUS]")) {
+        if (isManualOverrideRef.current) return;
         const loggedIn = msg.includes("LOGGED_IN");
         setIsWebviewLoggedIn(loggedIn);
         if (loggedIn) {
@@ -639,9 +643,9 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
               const navLinks = Array.from(document.querySelectorAll('nav a, div[role="navigation"] a, a[href*="/@"]'));
               const hasProfileLink = navLinks.some(a => {
                  const href = a.getAttribute('href');
-                 return href && href.startsWith('/@') && !href.includes('/@threads') && !href.includes('/@instagram');
+                 return href && href.includes('/@') && !href.includes('/@threads') && !href.includes('/@instagram');
               });
-              const hasLoggedInIcons = !!document.querySelector('svg[aria-label*="Home"], svg[aria-label*="Create"], svg[aria-label*="Search"], svg[aria-label*="Activity"]');
+              const hasLoggedInIcons = !!document.querySelector('svg[aria-label*="Home"], svg[aria-label*="Create"], svg[aria-label*="Search"], svg[aria-label*="Activity"], svg[aria-label*="ホーム"], svg[aria-label*="検索"], svg[aria-label*="アクティビティ"], svg[aria-label*="作成"]');
               const hasLoginLink = !!document.querySelector('a[href*="/login"], a[href*="/signup"]');
               
               // 4. 特殊：2FAやセキュリティ待ち画面か？
@@ -743,6 +747,7 @@ const AccountCard = ({ account, onUpdateProfile, onDeleteAccount, currentUser, i
     if (apiService.isElectron) {
       addLog("Performing Full Session Reset...");
       await apiService.clearSession(account.id, activeTab === 'note' ? 'note' : 'threads');
+      isManualOverrideRef.current = false;
       setForcingLogin(false);
       setIsWebviewLoggedIn(false);
       setWebviewKey(prev => prev + 1);
@@ -755,6 +760,7 @@ const handleUpdateAccount = (e) => {
   onUpdateProfile(account.id, {
     threadsUsername: editUsername,
     threadsPassword: editPassword,
+    threadsApiKey: editThreadsApiKey,
     noteEmail: editNoteEmail,
     notePassword: editNotePassword,
     name: editUsername // Optionally keep name in sync
@@ -1106,6 +1112,7 @@ const handleGenerateNoteArticle = async () => {
                 
                 <button 
                   onClick={() => {
+                    isManualOverrideRef.current = true;
                     setIsWebviewLoggedIn(true);
                     addLog("Manual verification override by user");
                   }}
@@ -1187,7 +1194,7 @@ const handleGenerateNoteArticle = async () => {
 
 
       {activeTab === 'status' && (
-        <div className="p-4 flex flex-col gap-4 h-full overflow-y-auto w-full absolute inset-0 bg-neutral-900/95 scrollbar-thin scrollbar-thumb-neutral-800">
+        <div className="flex-1 p-4 flex flex-col gap-4 overflow-y-auto w-full relative z-10 bg-neutral-900/30 scrollbar-thin scrollbar-thumb-neutral-800 border-t border-neutral-800/50">
           <div className="glass-panel p-4 rounded-xl border border-neutral-800/50 flex-shrink-0">
             <span className="text-xs text-neutral-500 mb-2 block uppercase font-bold tracking-widest">ログイン・運用ログ</span>
             <div className="bg-black/60 rounded-lg p-3 h-40 overflow-y-auto font-mono text-[10px] text-neutral-400 space-y-1.5 border border-neutral-800 shadow-inner">
@@ -1226,7 +1233,7 @@ const handleGenerateNoteArticle = async () => {
       )}
 
       {activeTab === 'threads' && (
-        <div className="p-6 flex gap-4 h-full overflow-y-auto w-full absolute inset-0">
+        <div className="flex-1 p-6 flex gap-4 overflow-y-auto w-full relative z-10 bg-neutral-900/30 border-t border-neutral-800/50">
           <div className="flex flex-col items-center">
             <img src={account.avatarUrl} className="w-10 h-10 rounded-full object-cover flex-shrink-0 border border-neutral-800" alt="avatar" />
             <div className="w-[1px] h-full bg-gradient-to-b from-neutral-700 to-transparent mt-3"></div>
@@ -1311,6 +1318,21 @@ const handleGenerateNoteArticle = async () => {
                       className="w-full pl-10 pr-4 py-3 bg-neutral-900/80 border border-neutral-700 rounded-xl text-white focus:outline-none focus:border-violet-500 transition-all"
                     />
                   </div>
+                </div>
+
+                <div className="mt-4">
+                  <label className="block text-xs font-bold text-neutral-500 uppercase tracking-widest mb-2">Threads APIキー (任意・公式API用)</label>
+                  <div className="relative">
+                     <Lock className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-neutral-600" />
+                     <input 
+                      type="password" 
+                      value={editThreadsApiKey} 
+                      onChange={(e) => setEditThreadsApiKey(e.target.value)}
+                      placeholder="THX--------------------------"
+                      className="w-full pl-10 pr-4 py-3 bg-neutral-900/80 border border-neutral-700 rounded-xl text-emerald-400 focus:outline-none focus:border-violet-500 transition-all font-mono"
+                    />
+                  </div>
+                  <p className="text-[10px] text-neutral-500 mt-2 tracking-wide font-medium">※未入力の場合は自動ブラウザ(Puppeteer)操作で投稿されます。</p>
                 </div>
                 
                 <div className="pt-2 border-t border-neutral-800 my-2 text-[10px] font-bold text-emerald-400 uppercase tracking-widest flex items-center gap-2">
@@ -1746,6 +1768,7 @@ const AccountsView = ({ accounts, onAccountsUpdate, currentUser, isElectron, isM
   const [showAddModal, setShowAddModal] = useState(false);
   const [newUsername, setNewUsername] = useState('');
   const [newPassword, setNewPassword] = useState('');
+  const [newThreadsApiKey, setNewThreadsApiKey] = useState('');
   const [newNoteEmail, setNewNoteEmail] = useState('');
   const [newNotePassword, setNewNotePassword] = useState('');
   const [proxyHost, setProxyHost] = useState('');
@@ -1816,6 +1839,7 @@ const AccountsView = ({ accounts, onAccountsUpdate, currentUser, isElectron, isM
       id: Date.now(),
       threadsUsername: newUsername,
       threadsPassword: newPassword,
+      threadsApiKey: newThreadsApiKey,
       noteEmail: newNoteEmail,
       notePassword: newNotePassword,
       proxy: proxyHost ? { host: proxyHost, port: proxyPort, username: proxyUser, password: proxyPass } : null,
@@ -1834,6 +1858,7 @@ const AccountsView = ({ accounts, onAccountsUpdate, currentUser, isElectron, isM
     setShowAddModal(false);
     setNewUsername('');
     setNewPassword('');
+    setNewThreadsApiKey('');
     setNewNoteEmail('');
     setNewNotePassword('');
   };
@@ -1982,6 +2007,19 @@ const AccountsView = ({ accounts, onAccountsUpdate, currentUser, isElectron, isM
                 </p>
               </div>
 
+              <div>
+                <label className="block text-sm font-bold text-neutral-400 mt-2 mb-2">Threads APIキー (任意・公式API用)</label>
+                <div className="relative">
+                  <Lock className="w-5 h-5 absolute left-3 top-1/2 transform -translate-y-1/2 text-neutral-500" />
+                  <input
+                    type="password"
+                    value={newThreadsApiKey}
+                    onChange={(e) => setNewThreadsApiKey(e.target.value)}
+                    className="w-full pl-10 pr-4 py-3 bg-neutral-900/50 border border-neutral-700 rounded-xl text-emerald-400 focus:outline-none focus:border-violet-500 transition-colors [-webkit-app-region:no-drag] pointer-events-auto relative z-50 font-mono"
+                    placeholder="THX--------------------------"
+                  />
+                </div>
+              </div>
 
               {/* Proxy Settings for Pro/Enterprise */}
               {((SUBSCRIPTION_PLANS[currentUser?.plan]?.features?.includes('proxy')) || currentUser?.role === 'admin') && (

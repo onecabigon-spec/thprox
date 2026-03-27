@@ -1,9 +1,4 @@
-/**
- * API Service Wrapper
- * This layer abstracts Electron-specific calls to allow the app to run in a web browser.
- * When running in Electron, it delegates to window.electronAPI.
- * When running on the web, it can be extended with fallbacks (e.g., Manus AI connectors).
- */
+import axios from 'axios';
 
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
@@ -41,8 +36,37 @@ const apiService = {
   },
 
   postToThreads: async (accountId, credentials, content, imagePath) => {
+    // 1. Try Official API if threadsApiKey is provided
+    if (credentials.threadsApiKey) {
+      try {
+        // Step 1: Create Media Container (Text-only for now as per simple request)
+        // Note: graph.threads.net/v1.0/me/threads is valid for the token owner
+        const containerRes = await axios.post(`https://graph.threads.net/v1.0/me/threads`, null, {
+          params: {
+            media_type: 'TEXT',
+            text: content,
+            access_token: credentials.threadsApiKey
+          }
+        });
+        const creationId = containerRes.data.id;
+
+        // Step 2: Publish
+        const publishRes = await axios.post(`https://graph.threads.net/v1.0/me/threads_publish`, null, {
+          params: {
+            creation_id: creationId,
+            access_token: credentials.threadsApiKey
+          }
+        });
+        return { success: true, id: publishRes.data.id };
+      } catch (e) {
+        console.error("Official Threads API failed:", e.response?.data || e.message);
+        return { success: false, error: "Official Threads API Error: " + (e.response?.data?.error?.message || e.message) };
+      }
+    }
+
+    // 2. Fall back to Puppeteer (Electron only)
     if (isElectron) return await window.electronAPI.postToThreads(accountId, credentials, content, imagePath);
-    return { success: false, error: "Direct posting via Puppeteer is only available in the Windows EXE version." };
+    return { success: false, error: "Direct posting via Puppeteer is only available in the Windows EXE version. Please set up the Official Threads API key to post from the web." };
   },
 
   runAction: async (accountId, action, payload) => {
@@ -169,6 +193,74 @@ const apiService = {
   getTrends: async (query) => {
     if (isElectron) return await window.electronAPI.getTrends(query);
     return { success: false, error: "Trends API only available in Windows version." };
+  },
+
+  // Official API Verification & Insights
+  testThreadsConnection: async (token) => {
+    try {
+      const res = await axios.get(`https://graph.threads.net/v1.0/me`, {
+        params: {
+          fields: 'id,username',
+          access_token: token
+        }
+      });
+      return { success: true, username: res.data.username, id: res.data.id };
+    } catch (e) {
+      console.error("Threads Connection Test failed:", e.response?.data || e.message);
+      return { success: false, error: e.response?.data?.error?.message || e.message };
+    }
+  },
+
+  getThreadsMedia: async (token) => {
+    try {
+      const res = await axios.get(`https://graph.threads.net/v1.0/me/threads`, {
+        params: {
+          fields: 'id,media_url,shortcode,text,timestamp,media_type,permalink',
+          access_token: token,
+          limit: 10
+        }
+      });
+      return { success: true, data: res.data.data };
+    } catch (e) {
+      console.error("Threads Media fetch failed:", e.response?.data || e.message);
+      return { success: false, error: e.response?.data?.error?.message || e.message };
+    }
+  },
+
+  getThreadsUserInsights: async (token) => {
+    try {
+      // Supported User metrics: likes, replies, followers_count, follower_demographics, reposts, views, quotes, clicks
+      const res = await axios.get(`https://graph.threads.net/v1.0/me/threads_insights`, {
+        params: {
+          metric: 'views,likes,replies,reposts,quotes',
+          access_token: token
+        },
+        timeout: 15000 // 15 seconds timeout
+      });
+      console.log(`[API:Insights] Successfully fetched user insights.`);
+      return { success: true, data: res.data.data };
+    } catch (e) {
+      console.error("[API:Insights] Threads User Insights failed:", e.response?.data || e.message);
+      return { success: false, error: e.response?.data?.error?.message || e.message };
+    }
+  },
+
+  getThreadsMediaInsights: async (token, mediaId) => {
+    try {
+      // Metric names: views, likes, replies, reposts, quotes
+      const res = await axios.get(`https://graph.threads.net/v1.0/${mediaId}/insights`, {
+        params: {
+          metric: 'views,likes,replies,reposts,quotes',
+          access_token: token
+        },
+        timeout: 15000 // 15 seconds timeout
+      });
+      console.log(`[API:Insights] Successfully fetched media insights for ${mediaId}.`);
+      return { success: true, data: res.data.data };
+    } catch (e) {
+      console.error(`[API:Insights] Threads Media Insights failed for ${mediaId}:`, e.response?.data || e.message);
+      return { success: false, error: e.response?.data?.error?.message || e.message };
+    }
   }
 };
 
